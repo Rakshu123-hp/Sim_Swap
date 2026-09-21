@@ -1,0 +1,10 @@
+.env
+*.pyc
+__pycache__/
+backend/db/*.db
+backend/risk_engine/model.joblib
+node_modules/
+.venv/
+venv/
+.pytest_cache/
+*.log
