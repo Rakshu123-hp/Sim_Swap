@@ -1,27 +1,25 @@
-"""API routes: auth, risk evaluation, OTP verification, dashboard, agent heartbeat.
+"""API routes: auth, customer data, risk evaluation, OTP verification, dashboard,
+analyst/admin analytics, and agent heartbeat.
 
 Every request body is validated and 4xx errors carry a clear {error: {field: msg}}
-shape. This layer builds the *enriched* event dict (DB context) that the pure
-risk engine consumes, then persists the outcome and raises alerts via the
-notifications module — it never contains scoring logic or raw SQL.
+shape. Customer-scoped endpoints always resolve the customer from the authenticated
+JWT user (never from the request body), so one user can never read another
+customer's data. Scoring logic lives in backend.risk_engine and orchestration in
+backend.api.service.
 """
 
-import secrets
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 from flask import Blueprint, g, jsonify, request
 from werkzeug.security import check_password_hash, generate_password_hash
 
-from backend.api.auth import encode_token, token_required
+from backend.api.auth import encode_token, role_required, token_required
+from backend.api.service import evaluate_and_store, validate_event_request
 from backend.db import models
-from backend.risk_engine import config
-from backend.risk_engine.engine import evaluate_event
-from notifications import notifier
 
 bp = Blueprint("api", __name__)
 
 VALID_ROLES = {"analyst", "customer", "admin"}
-EVENT_TYPES = {"transaction", "login", "sim_change"}
 OTP_TTL_MINUTES = 5
 
 
@@ -33,10 +31,6 @@ def _is_valid_email(value):
 
 
 # ---------------------------------------------------------------- helpers
-
-def _utcnow_db():
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-
 
 def _utcnow_iso():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -60,18 +54,37 @@ def _bad(errors, status=400):
     return jsonify(error=errors), status
 
 
-def _new_otp_code():
-    return f"{secrets.randbelow(1000000):06d}"
+def _user_customer():
+    """Resolve (creates if needed) the customer attached to the JWT user."""
+    return models.get_or_create_customer_for_user(g.user)
 
 
-def _hours_since(db_timestamp):
-    if not db_timestamp:
+def _customer_payload(customer):
+    if not customer:
         return None
-    try:
-        then = datetime.strptime(db_timestamp, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
-        return max((datetime.now(timezone.utc) - then).total_seconds() / 3600.0, 0.0)
-    except ValueError:
-        return None
+    return {
+        "id": customer["id"],
+        "user_id": customer.get("user_id"),
+        "name": customer["name"],
+        "email": customer.get("email"),
+        "phone": customer.get("phone"),
+        "home_city": customer.get("home_city"),
+        "status": customer.get("status") or "active",
+        "created_at": customer.get("created_at"),
+    }
+
+
+def _public_user(user):
+    customer = models.get_customer_by_user(user["id"])
+    return {
+        "id": user["id"],
+        "username": user["username"],
+        "role": user["role"],
+        "name": user["name"],
+        "email": user.get("email"),
+        "created_at": user.get("created_at"),
+        "customer": _customer_payload(customer),
+    }
 
 
 # ---------------------------------------------------------------- auth
@@ -84,7 +97,7 @@ def register():
     errors = {}
     username = (data.get("username") or "").strip()
     password = data.get("password") or ""
-    role = (data.get("role") or "analyst").strip()
+    role = (data.get("role") or "customer").strip()
     name = (data.get("name") or "").strip() or None
     email = (data.get("email") or "").strip().lower()
 
@@ -107,9 +120,12 @@ def register():
     user_id = models.create_user(username, generate_password_hash(password),
                                  role=role, name=name, email=email)
     user = models.get_user_by_id(user_id)
+    customer = models.get_or_create_customer_for_user(user)
+    models.touch_user(user_id)
     models.log_audit("auth", "register", user_id,
                      {"username": username, "role": role, "email": email or None})
-    return jsonify(token=encode_token(user), user=_public_user(user)), 201
+    return jsonify(token=encode_token(user), user=_public_user(user),
+                   customer=_customer_payload(customer)), 201
 
 
 @bp.route("/api/auth/login", methods=["POST"])
@@ -122,13 +138,68 @@ def login():
     user = models.get_user_by_login(login_identifier)
     if user is None or not check_password_hash(user["password_hash"], password):
         return _bad("Invalid email/username or password", 401)
+    customer = models.get_or_create_customer_for_user(user)
+    models.touch_user(user["id"])
     models.log_audit("auth", "login", user["id"], {"username": user["username"]})
-    return jsonify(token=encode_token(user), user=_public_user(user))
+    return jsonify(token=encode_token(user), user=_public_user(user),
+                   customer=_customer_payload(customer))
 
 
-def _public_user(user):
-    return {"id": user["id"], "username": user["username"],
-            "role": user["role"], "name": user["name"], "email": user.get("email")}
+@bp.route("/api/auth/me", methods=["GET"])
+@token_required
+def auth_me():
+    customer = _user_customer()
+    return jsonify(user=_public_user(g.user), customer=_customer_payload(customer))
+
+
+# ---------------------------------------------------------------- customer profile
+
+@bp.route("/api/customer/me", methods=["GET"])
+@token_required
+def customer_me():
+    customer = _user_customer()
+    return jsonify(customer=_customer_payload(customer),
+                   stats=models.customer_stats(customer["id"]))
+
+
+@bp.route("/api/customer/me/transactions", methods=["GET"])
+@token_required
+def customer_me_transactions():
+    customer = _user_customer()
+    return jsonify(customer_id=customer["id"],
+                   transactions=models.list_transactions(100, customer["id"]))
+
+
+@bp.route("/api/customer/me/logins", methods=["GET"])
+@token_required
+def customer_me_logins():
+    customer = _user_customer()
+    return jsonify(customer_id=customer["id"],
+                   logins=models.list_login_events(100, customer["id"]))
+
+
+@bp.route("/api/customer/me/sim-changes", methods=["GET"])
+@token_required
+def customer_me_sim_changes():
+    customer = _user_customer()
+    return jsonify(customer_id=customer["id"],
+                   sim_events=models.list_sim_events(100, customer["id"]))
+
+
+@bp.route("/api/customer/me/alerts", methods=["GET"])
+@token_required
+def customer_me_alerts():
+    customer = _user_customer()
+    return jsonify(customer_id=customer["id"],
+                   alerts=models.list_alerts(100, customer["id"]))
+
+
+@bp.route("/api/customer/me/risk-summary", methods=["GET"])
+@token_required
+def customer_me_risk_summary():
+    customer = _user_customer()
+    return jsonify(customer_id=customer["id"],
+                   risk_summary=models.risk_summary(customer["id"]))
 
 
 # ---------------------------------------------------------------- risk engine
@@ -140,139 +211,18 @@ def risk_evaluate():
     if data is None:
         return _bad("Request body must be valid JSON", 400)
 
-    customer_id = _to_int(data.get("customer_id"))
     event_type = (data.get("event_type") or "").strip()
     event = data.get("event")
-    viewer = g.user
+    customer = _user_customer()
 
-    errors = {}
-    if customer_id is None:
-        errors["customer_id"] = "customer_id must be an integer"
-    elif models.get_customer(customer_id) is None:
-        return _bad({"customer_id": "Unknown customer"}, 404)
-    if event_type not in EVENT_TYPES:
-        errors["event_type"] = f"event_type must be one of {sorted(EVENT_TYPES)}"
-    if not isinstance(event, dict):
-        errors["event"] = "event must be an object/dict"
-
-    customer = models.get_customer(customer_id) if customer_id else None
-
-    if event_type == "transaction" and isinstance(event, dict):
-        amount = event.get("amount")
-        try:
-            amount_f = float(amount)
-        except (TypeError, ValueError):
-            amount_f = None
-        if amount_f is None or amount_f < 0:
-            errors["event.amount"] = "amount is required and must be a non-negative number"
-
+    errors = validate_event_request(event_type, event)
     if errors:
         return _bad(errors)
 
-    rich = dict(event)
-    rich["customer_id"] = customer_id
-    rich["event_type"] = event_type
-    rich["home_city"] = customer["home_city"]
-
-    # DB context for the pure rule engine
-    device_id = event.get("device_id")
-    rich["is_new_device"] = not models.has_seen_device(customer_id, device_id)
-    failed_logins = models.recent_failed_logins(customer_id, config.FAILED_LOGIN_WINDOW_HOURS)
-    if event_type == "login" and not event.get("success", True):
-        failed_logins += 1
-    rich["failed_logins"] = failed_logins
-
-    recent_swaps = models.recent_sim_changes(customer_id, config.SIM_CHANGE_FREQ_WINDOW_HOURS)
-    rich["sim_changes_recent"] = len(recent_swaps)
-    rich["hours_since_sim_change"] = (
-        _hours_since(recent_swaps[0]["recorded_at"]) if recent_swaps
-        else (0.0 if event_type == "sim_change" else None)
-    )
-
-    result = evaluate_event(rich)
-
-    event_time = event.get("timestamp") or _utcnow_iso()
-    success = 0 if (event_type == "login" and not event.get("success", True)) else 1
-    amount = event.get("amount")
-    if amount is not None:
-        try:
-            amount = float(amount)
-        except (TypeError, ValueError):
-            amount = None
-
-    if event_type == "sim_change":
-        event_id = models.create_sim_event(
-            customer_id,
-            new_sim_id=(event.get("sim_id") or "SIM-CHG-LIVE"),
-            device_id=device_id,
-            ip_address=event.get("ip_address"),
-            risk_score=result["risk_score"],
-            decision=result["decision"],
-            recorded_at=event_time,
-        )
-    else:
-        event_id = models.create_transaction(
-            customer_id,
-            txn_type=(event.get("txn_type") or ("transfer" if event_type == "transaction" else "login")),
-            amount=amount,
-            currency=(event.get("currency") or "INR"),
-            channel=event.get("channel"),
-            device_id=device_id,
-            ip_address=event.get("ip_address"),
-            city=event.get("city"),
-            event_time=event_time,
-            risk_score=result["risk_score"],
-            rule_score=result["rule_score"],
-            ml_probability=result["ml_probability"],
-            decision=result["decision"],
-            reasons=result["reasons"],
-            success=success,
-        )
-
-    models.log_audit(event_type, "evaluated", event_id,
-                     {"decision": result["decision"], "risk_score": result["risk_score"],
-                      "viewer": viewer["username"]})
-
-    alert_id = None
-    otp_required = False
-    otp_expires_at = None
-
-    if result["decision"] == "BLOCK":
-        message = (f"BLOCKED {event_type} #{event_id} for {customer['name']}. "
-                   f"Risk {result['risk_score']}. "
-                   f"Reasons: {'; '.join(result['reasons']) or 'no specific rule'}")
-        alert_id = models.create_alert(
-            customer_id, "high", message,
-            transaction_id=(None if event_type == "sim_change" else event_id),
-            sim_event_id=(event_id if event_type == "sim_change" else None))
-        notifier.notify_alert(customer, message)
-
-    elif event_type != "sim_change" and result["decision"] == "STEP_UP":
-        code = _new_otp_code()
-        expires = (datetime.now(timezone.utc)
-                   + timedelta(minutes=OTP_TTL_MINUTES)).strftime("%Y-%m-%d %H:%M:%S")
-        models.create_otp(event_id, code, expires)
-        otp_required = True
-        otp_expires_at = (datetime.now(timezone.utc)
-                          + timedelta(minutes=OTP_TTL_MINUTES)).strftime("%Y-%m-%dT%H:%M:%SZ")
-        message = (f"STEP_UP requested for {event_type} #{event_id} of {customer['name']} "
-                   f"(risk {result['risk_score']}). OTP issued.")
-        alert_id = models.create_alert(customer_id, "medium", message,
-                                       transaction_id=event_id)
-        notifier.notify_otp(customer, code, event_id)
-
-    return jsonify(
-        event_id=event_id,
-        event_type=event_type,
-        decision=result["decision"],
-        risk_score=result["risk_score"],
-        rule_score=result["rule_score"],
-        ml_probability=result["ml_probability"],
-        reasons=result["reasons"],
-        otp_required=otp_required,
-        otp_expires_at=otp_expires_at,
-        alert_id=alert_id,
-    )
+    result = evaluate_and_store(customer, event_type, event, viewer=g.user["username"])
+    result["customer_id"] = customer["id"]
+    result["transaction_id"] = result["event_id"] if event_type != "sim_change" else None
+    return jsonify(result)
 
 
 # ---------------------------------------------------------------- otp
@@ -297,12 +247,23 @@ def otp_verify():
     txn = models.get_transaction(transaction_id)
     if txn is None:
         return _bad({"transaction_id": "Unknown transaction"}, 404)
+
+    if g.user["role"] == "customer":
+        customer = _user_customer()
+        if txn["customer_id"] != customer["id"]:
+            return _bad("You can only verify OTPs for your own transactions", 403)
+
     otp = models.get_latest_otp(transaction_id)
     if otp is None:
         return _bad("No OTP was issued for this transaction", 404)
     if otp["used"]:
         return _bad("OTP has already been used", 400)
-    if _utcnow_db() > otp["expires_at"]:
+    try:
+        _expires = datetime.strptime(otp["expires_at"], "%Y-%m-%d %H:%M:%S")
+        _expires = _expires.replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return _bad("OTP has an invalid expiry", 400)
+    if datetime.now(timezone.utc) > _expires:
         return _bad("OTP has expired", 400)
     if otp["code"] != code:
         return _bad("Invalid OTP code", 400)
@@ -321,30 +282,134 @@ def otp_verify():
 @bp.route("/api/dashboard/summary", methods=["GET"])
 @token_required
 def dashboard_summary():
-    agents = models.list_agents()
+    is_customer_view = g.user["role"] == "customer"
+    customer = _user_customer() if is_customer_view else None
+    customer_id = customer["id"] if customer else None
+
+    stats = models.transaction_counts(customer_id)
+    stats["customer_id"] = customer_id
+    if customer_id is not None:
+        cstats = models.customer_stats(customer_id)
+        stats.update(alerts=cstats["alerts"], login_attempts=cstats["login_attempts"],
+                     sim_changes=cstats["sim_changes"])
+    else:
+        stats.update(alerts=len(models.list_alerts(1000, None)),
+                     customers=len(models.list_customers()))
+
+    if is_customer_view:
+        agents = []
+        agents_online = 0
+    else:
+        agents = models.list_agents()
+        agents_online = sum(
+            1 for a in _with_agent_status(agents) if a["status"] == "online")
+        agents = _with_agent_status(agents)
+
+    return jsonify(
+        profile={
+            **(_public_user(g.user)),
+            "customer": _customer_payload(customer),
+        },
+        stats=stats,
+        transactions=models.list_transactions(100, customer_id),
+        logins=models.list_login_events(50, customer_id),
+        sim_events=models.list_sim_events(50, customer_id),
+        alerts=models.list_alerts(100, customer_id),
+        agents=agents,
+        agents_online=agents_online,
+        otps=models.pending_otps(20, customer_id),
+        risk_summary=models.risk_summary(customer_id) if customer_id else None,
+        last_updated=_utcnow_iso(),
+    )
+
+
+def _with_agent_status(agents):
     now = datetime.now(timezone.utc)
-    enriched_agents = []
+    out = []
     for a in agents:
         try:
-            last = datetime.strptime(a["last_heartbeat"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+            last = datetime.strptime(a["last_heartbeat"], "%Y-%m-%d %H:%M:%S").replace(
+                tzinfo=timezone.utc)
             status = "online" if (now - last).total_seconds() <= 60 else "stale"
         except ValueError:
             status = "stale"
-        enriched_agents.append({**a, "status": status})
+        out.append({**a, "status": status})
+    return out
 
+
+# ---------------------------------------------------------------- analyst / admin
+
+@bp.route("/api/admin/users", methods=["GET"])
+@token_required
+@role_required("analyst", "admin")
+def admin_users():
+    return jsonify(users=models.list_users())
+
+
+@bp.route("/api/admin/customers", methods=["GET"])
+@token_required
+@role_required("analyst", "admin")
+def admin_customers():
+    return jsonify(customers=models.list_customers())
+
+
+@bp.route("/api/admin/customers/<int:customer_id>", methods=["GET"])
+@token_required
+@role_required("analyst", "admin")
+def admin_customer_detail(customer_id):
+    customer = models.get_customer(customer_id)
+    if customer is None:
+        return _bad({"customer_id": "Unknown customer"}, 404)
+    user = models.get_user_by_id(customer["user_id"]) if customer.get("user_id") else None
     return jsonify(
-        stats={
-            **models.transaction_counts(),
-            "alerts": len(models.list_alerts()),
-            "customers": len(models.list_customers()),
-            "agents": len(agents),
-        },
-        transactions=models.list_transactions(100),
-        sim_events=models.list_sim_events(50),
-        alerts=models.list_alerts(100),
-        agents=enriched_agents,
-        otps=models.pending_otps(20),
+        customer=_customer_payload(customer),
+        owner={"username": user["username"], "role": user["role"],
+               "email": user.get("email"), "created_at": user.get("created_at")} if user else None,
+        stats=models.customer_stats(customer_id),
+        risk_summary=models.risk_summary(customer_id),
+        transactions=models.list_transactions(100, customer_id),
+        logins=models.list_login_events(50, customer_id),
+        sim_events=models.list_sim_events(50, customer_id),
+        alerts=models.list_alerts(100, customer_id),
     )
+
+
+@bp.route("/api/admin/customers/<int:customer_id>/transactions", methods=["GET"])
+@token_required
+@role_required("analyst", "admin")
+def admin_customer_transactions(customer_id):
+    if models.get_customer(customer_id) is None:
+        return _bad({"customer_id": "Unknown customer"}, 404)
+    return jsonify(customer_id=customer_id,
+                   transactions=models.list_transactions(200, customer_id))
+
+
+@bp.route("/api/admin/customers/<int:customer_id>/risk", methods=["GET"])
+@token_required
+@role_required("analyst", "admin")
+def admin_customer_risk(customer_id):
+    if models.get_customer(customer_id) is None:
+        return _bad({"customer_id": "Unknown customer"}, 404)
+    return jsonify(customer_id=customer_id,
+                   risk_summary=models.risk_summary(customer_id),
+                   stats=models.customer_stats(customer_id))
+
+
+@bp.route("/api/admin/alerts", methods=["GET"])
+@token_required
+@role_required("analyst", "admin")
+def admin_alerts():
+    return jsonify(alerts=models.list_alerts(500, None))
+
+
+@bp.route("/api/admin/analytics", methods=["GET"])
+@token_required
+@role_required("analyst", "admin")
+def admin_analytics():
+    analytics = models.analytics()
+    analytics["users"] = models.count_users()
+    analytics["customers"] = models.count_customers()
+    return jsonify(analytics)
 
 
 # ---------------------------------------------------------------- agents

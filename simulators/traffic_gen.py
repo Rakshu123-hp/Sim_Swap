@@ -4,6 +4,11 @@ Posts realistic login / transaction / SIM-change events to a running API at an
 adjustable rate. Talk to the API over HTTP only — this module has no access to
 the backend code.
 
+The generator logs in as a real account and resolves that account's own
+customer via GET /api/auth/me, then posts events for that customer only, so the
+events are always attributed server-side to the authenticated user's customer
+(no more hardcoded customer_id = randint(1, 5)).
+
 Usage from the repo root:
     python -m simulators.traffic_gen --rate 2 --duration 60
 """
@@ -87,17 +92,31 @@ def get_token(base_url, username, password):
     raise SystemExit(f"Could not authenticate as {username}: {r.status_code} {r.text}")
 
 
+def get_own_customer_id(base_url, headers):
+    """Resolve the authenticated account's customer id from the API."""
+    r = requests.get(f"{base_url}/api/auth/me", headers=headers, timeout=10)
+    if r.status_code != 200:
+        raise SystemExit(f"Could not resolve own customer: {r.status_code} {r.text}")
+    data = r.json()
+    customer = data.get("customer") or (data.get("user") or {}).get("customer")
+    if not customer or not customer.get("id"):
+        raise SystemExit("Authenticated account has no customer profile: "
+                         "register/log in, then retry.")
+    return customer["id"]
+
+
 def run(base_url, rate, duration, username, password, seed):
     rng = random.Random(seed)
     token = get_token(base_url, username, password)
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    print(f"traffic_gen connected to {base_url} as {username} @ {rate} ev/s for {duration}s")
+    customer_id = get_own_customer_id(base_url, headers)
+    print(f"traffic_gen connected to {base_url} as {username} (customer {customer_id}) "
+          f"@ {rate} ev/s for {duration}s")
 
     deadline = time.time() + duration
     sent = 0
     by_decision = {}
     while time.time() < deadline:
-        customer_id = rng.randint(1, 5)
         event_type, event = build_event(rng, customer_id)
         try:
             resp = requests.post(
@@ -126,7 +145,7 @@ if __name__ == "__main__":
     parser.add_argument("--url", default="http://localhost:5000")
     parser.add_argument("--rate", type=float, default=1.0, help="events per second")
     parser.add_argument("--duration", type=float, default=60, help="seconds to run")
-    parser.add_argument("--username", default="sim-customer")
+    parser.add_argument("--username", default="sim-customer", help="existing demo account")
     parser.add_argument("--password", default="demo123")
     parser.add_argument("--seed", type=int, default=7)
     args = parser.parse_args(sys.argv[1:])

@@ -7,15 +7,18 @@ CREATE TABLE IF NOT EXISTS users (
     password_hash TEXT NOT NULL,
     role          TEXT NOT NULL DEFAULT 'analyst',
     name          TEXT,
-    created_at    TEXT NOT NULL DEFAULT (datetime('now'))
+    created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at    TEXT
 );
 
 CREATE TABLE IF NOT EXISTS customers (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id    INTEGER REFERENCES users(id),
     name       TEXT NOT NULL,
     phone      TEXT,
     email      TEXT,
     home_city  TEXT,
+    status     TEXT NOT NULL DEFAULT 'active',
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -68,6 +71,7 @@ CREATE TABLE IF NOT EXISTS alerts (
     severity       TEXT NOT NULL,
     message        TEXT NOT NULL,
     channels       TEXT,
+    status         TEXT NOT NULL DEFAULT 'open',
     notified_at    TEXT NOT NULL DEFAULT (datetime('now'))
 );
 

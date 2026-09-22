@@ -1,6 +1,7 @@
-"""Seed the SQLite DB with a handful of demo customers and default users.
+"""Seed the SQLite DB with demo customers and default users.
 
-Idempotent: safe to run repeatedly.
+Idempotent: safe to run repeatedly (python -m backend.db.seed). Re-running
+never duplicates users, customers, or user<->customer links.
 """
 
 from werkzeug.security import generate_password_hash
@@ -27,16 +28,45 @@ DEMO_USERS = [
 ]
 
 
+def _customer_name_for_user(username):
+    return {"sim-customer": "Simulated Customer",
+            "analyst": "Demo Analyst",
+            "admin": "System Admin"}.get(username, username.title())
+
+
 def seed():
     models.init_db()
+
+    users_created = 0
+    customers_created = 0
+    links_created = 0
+
     for u in DEMO_USERS:
-        if not models.get_user_by_username(u["username"]):
-            models.create_user(u["username"], generate_password_hash(u["password"]),
-                               role=u["role"], name=u["name"])
-    if not models.list_customers():
-        for c in DEMO_CUSTOMERS:
+        user = models.get_user_by_username(u["username"])
+        if user is None:
+            user_id = models.create_user(u["username"], generate_password_hash(u["password"]),
+                                         role=u["role"], name=u["name"])
+            users_created += 1
+        else:
+            user_id = user["id"]
+        if models.get_customer_by_user(user_id) is None:
+            models.create_customer(
+                name=_customer_name_for_user(u["username"]),
+                email=f"{u['username']}@securebank.test",
+                home_city="Haveri",
+                user_id=user_id,
+            )
+            links_created += 1
+            customers_created += 1
+
+    for c in DEMO_CUSTOMERS:
+        if models.get_customer_by_email(c["email"]) is None:
             models.create_customer(**c)
-    print(f"Seeded {len(models.list_customers())} customers and {len(DEMO_USERS)} users.")
+            customers_created += 1
+
+    print(f"Seeded customers={len(models.list_customers())} "
+          f"(+{customers_created} created), users={len(models.list_users())} "
+          f"(+{users_created} created), user-customer links (+{links_created}).")
 
 
 if __name__ == "__main__":

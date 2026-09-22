@@ -46,3 +46,18 @@ def token_required(f):
         return f(*args, **kwargs)
 
     return wrapper
+
+
+def role_required(*roles):
+    """Restrict an endpoint to authenticated users holding one of the given roles.
+
+    Must be chained below token_required so g.user is populated.
+    """
+    def decorator(f):
+        @wraps(f)
+        def wrapper(*args, **kwargs):
+            if g.user.get("role") not in roles:
+                return jsonify(error=f"Forbidden: requires one of {sorted(roles)} role"), 403
+            return f(*args, **kwargs)
+        return wrapper
+    return decorator

@@ -5,6 +5,7 @@ Serves the plain-JS dashboard from frontend/ at / too, so the whole demo runs
 from one process.
 """
 
+import atexit
 import os
 from pathlib import Path
 
@@ -14,6 +15,7 @@ from flask_cors import CORS
 
 from backend.api.routes import bp
 from backend.db import models
+from backend.demo_traffic import DemoTrafficManager
 
 FRONTEND_DIR = Path(__file__).resolve().parents[2] / "frontend"
 DEV_SECRET = "dev-only-secret-change-me"
@@ -31,6 +33,17 @@ def create_app(test_config=None):
 
     models.init_db()
     app.register_blueprint(bp)
+
+    demo = DemoTrafficManager.from_env()
+    app.extensions["demo_traffic"] = demo
+    if test_config:
+        # tests can override enabled/interval via config
+        demo.enabled = bool(test_config.get("ENABLE_DEMO_TRAFFIC", demo.enabled))
+        demo.interval = int(test_config.get("DEMO_TRAFFIC_INTERVAL", demo.interval))
+        demo.rate = int(test_config.get("DEMO_TRAFFIC_RATE", demo.rate))
+    demo.start()
+    if demo.enabled:
+        atexit.register(demo.stop)
 
     @app.get("/")
     def index():
